@@ -619,6 +619,8 @@ def main() -> None:
     args = parser.parse_args()
 
     # Подставляем значения из config, если параметр не задан в консоли
+    if args.format is None:
+        args.format = config.get("output_format", "md")
     if args.max_size_mb is None:
         args.max_size_mb = config["max_file_size_mb"]
     if args.max_objects is None:
@@ -627,8 +629,6 @@ def main() -> None:
         args.max_words = config.get("max_words_per_file")
     if args.array_path is None:
         args.array_path = config.get("array_path", "") or ""
-    if args.format is None:
-        args.format = config.get("output_format", "md")
 
     if args.output_dir is None:
         args.output_dir = os.path.join(SCRIPT_DIR, "dist")

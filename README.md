@@ -2,6 +2,8 @@
 
 Split large JSON files (e.g. Telegram exports) into Markdown chunks for NotebookLM upload.
 
+**Use case:** This script works well for exporting and analyzing large volumes of group messages. Dump your chat/group export as JSON, run the splitter, then upload the resulting Markdown files to NotebookLM to search, summarize, and ask questions across the whole conversation history.
+
 - **src/** — put JSON here  
 - **dist/** — output: `name_1.md`, `name_2.md`, …
 
