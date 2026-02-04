@@ -14,6 +14,7 @@ import argparse
 import ijson
 import json
 import os
+import re
 import sys
 
 # Путь к config.json рядом со скриптом (работает при любом текущем каталоге)
@@ -71,9 +72,25 @@ def _extract_text(obj) -> str:
     return str(obj)
 
 
+_WS_RE = re.compile(r"\s+")
+
+
+def _normalize_text(s: str) -> str:
+    """
+    Нормализует текст для NotebookLM:
+    - убирает переносы строк и любые повторяющиеся пробельные символы
+    - удаляет пустые строки (как частный случай)
+    """
+    if not s:
+        return ""
+    return _WS_RE.sub(" ", s).strip()
+
+
 def obj_to_md(obj: dict) -> str:
     """
-    Конвертирует один объект (сообщение Telegram и т.п.) в блок Markdown (без пустых строк).
+    Конвертирует один объект (сообщение Telegram и т.п.) в компактный блок Markdown:
+    - без пустых строк
+    - без переносов внутри текста (в одну строку)
     """
     date = obj.get("date", "")
     if date and "T" in str(date):
@@ -84,12 +101,12 @@ def obj_to_md(obj: dict) -> str:
         text = " ".join(_extract_text(e) for e in obj["text_entities"])
     else:
         text = _extract_text(text)
+    text = _normalize_text(text)
     lines = [f"### {date} | {author}"]
     if text:
-        for line in text.split("\n"):
-            if line.strip().startswith("#"):
-                line = "\\" + line
-            lines.append(line)
+        if text.startswith("#"):
+            text = "\\" + text
+        lines.append(text)
     return "\n".join(lines)
 
 
@@ -144,7 +161,8 @@ def json_to_txt(
                         text = " ".join(_extract_text(e) for e in obj["text_entities"])
                     else:
                         text = _extract_text(text)
-                    line = f"{date} | {author}: {text}".replace("\n", " ")
+                    text = _normalize_text(text)
+                    line = f"{date} | {author}: {text}"
                     fout.write(line.rstrip() + "\n")
                 else:
                     # jsonl: один JSON-объект на строку
@@ -260,6 +278,20 @@ def split_json(
 
     if current_objects or current_md_blocks:
         write_part()
+
+    # В первый файл добавляем краткий отчёт с общим количеством сообщений.
+    if output_format == "md" and created_files:
+        first_path = created_files[0]
+        tmp_path = first_path + ".tmp"
+        report_line = f"### Отчёт | Всего сообщений: {total_read:,}"
+        with open(first_path, "r", encoding="utf-8") as fin, open(tmp_path, "w", encoding="utf-8") as fout:
+            fout.write(report_line + "\n---\n")
+            for line in fin:
+                # На всякий случай удаляем пустые строки.
+                if not line.strip():
+                    continue
+                fout.write(line.rstrip() + "\n")
+        os.replace(tmp_path, first_path)
 
     if progress_interval > 0:
         print(f"  Всего обработано: {total_read:,} объектов, частей: {len(created_files)}", flush=True)
