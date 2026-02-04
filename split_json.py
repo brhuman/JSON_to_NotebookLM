@@ -23,8 +23,11 @@ CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 DEFAULT_CONFIG = {
     "max_file_size_mb": 150.0,
     "max_objects_per_file": 400_000,
+    "max_words_per_file": 450_000,  # NotebookLM ~500k limit, margin for safety
     "array_path": "messages",
     "output_format": "md",
+    "author_at_top": True,
+    "skip_empty_messages": True,
 }
 
 
@@ -183,36 +186,52 @@ def split_json(
     output_prefix: str = "part",
     max_file_size_mb: float | None = None,
     max_objects_per_file: int | None = None,
+    max_words_per_file: int | None = None,
     array_path: str = "",
     progress_interval: int = 50_000,
     output_format: str = "md",
+    author_at_top: bool = True,
+    skip_empty_messages: bool = True,
 ) -> list[str]:
     """
     Читает JSON-массив потоково и сохраняет части в output_dir (part_1.json или part_1.md).
 
     Args:
         output_format: "md" — Markdown (дата | автор: текст); "json" — компактный JSON.
+        author_at_top: для MD — вынести автора один раз в начало, в блоках только ### дата и текст.
+        skip_empty_messages: для MD — не писать блоки без текста.
+        max_words_per_file: для MD — макс. слов в одном файле (NotebookLM ~500k, с запасом 450k).
     """
     os.makedirs(output_dir, exist_ok=True)
-    if max_file_size_mb is None and max_objects_per_file is None:
+    has_limit = (
+        max_file_size_mb is not None
+        or max_objects_per_file is not None
+        or (output_format == "md" and max_words_per_file is not None)
+    )
+    if not has_limit:
         raise ValueError(
-            "Укажите хотя бы одно ограничение: max_file_size_mb или max_objects_per_file"
+            "Укажите хотя бы одно ограничение: max_file_size_mb, max_objects_per_file или max_words_per_file (для md)"
         )
 
     ext = ".md" if output_format == "md" else ".json"
     max_size_bytes = int(max_file_size_mb * 1024 * 1024) if max_file_size_mb else None
     created_files: list[str] = []
 
+    # MD: разделитель между блоками (короче чем \n---\n)
+    sep = "\n\n"
+    sep_len = len(sep.encode("utf-8"))
+
     # MD: накапливаем готовые строки (одна конвертация на объект). JSON: накапливаем объекты.
     current_objects: list = []  # для json — список dict; для md не используется
     current_md_blocks: list[str] = []  # для md — готовые блоки, без повторной конвертации
     current_size = 0
+    current_words = 0  # для md — число слов в текущей части (под лимит NotebookLM)
     part_index = 1
 
     total_read = 0
 
     def write_part() -> None:
-        nonlocal current_objects, current_size, part_index, current_md_blocks
+        nonlocal current_objects, current_size, part_index, current_md_blocks, current_words
         n = len(current_md_blocks) if output_format == "md" else len(current_objects)
         if n == 0:
             return
@@ -221,7 +240,20 @@ def split_json(
             print(f"  Запись части {part_index}: {os.path.basename(out_name)} ({n:,} объектов)...", flush=True)
         with open(out_name, "w", encoding="utf-8") as f:
             if output_format == "md":
-                f.write("\n---\n".join(current_md_blocks))
+                if author_at_top and current_md_blocks:
+                    first_block = current_md_blocks[0]
+                    first_line = first_block.split("\n", 1)[0]
+                    author = first_line.split(" | ", 1)[1] if " | " in first_line else ""
+                    f.write(f"Source: {author}\n\n")
+                    transformed = []
+                    for block in current_md_blocks:
+                        first_ln = block.split("\n", 1)[0]
+                        date_only = first_ln.split(" | ", 1)[0]  # "### 2025-01-01 01:34"
+                        rest = block.split("\n", 1)[1] if "\n" in block else ""
+                        transformed.append(date_only + ("\n" + rest if rest else ""))
+                    f.write(sep.join(transformed))
+                else:
+                    f.write(sep.join(current_md_blocks))
             else:
                 json.dump(current_objects, f, ensure_ascii=False, separators=(",", ":"))
         created_files.append(os.path.abspath(out_name))
@@ -232,6 +264,7 @@ def split_json(
         current_objects = []
         current_md_blocks = []
         current_size = 0
+        current_words = 0
 
     # Путь к элементам массива для ijson: "item" для корня, "messages.item" для obj["messages"]
     ijson_prefix = f"{array_path}.item" if array_path else "item"
@@ -243,13 +276,16 @@ def split_json(
         # Потоковый парсинг массива: объекты приходят по одному
         parser = ijson.items(f, ijson_prefix)
 
-        sep = "\n---\n"
-        sep_len = len(sep.encode("utf-8"))
-
         for obj in parser:
             if output_format == "md":
                 obj_content = obj_to_md(obj)
+                if skip_empty_messages and "\n" not in obj_content.strip():
+                    total_read += 1
+                    if progress_interval > 0 and total_read % progress_interval == 0:
+                        print(f"  Обработано объектов: {total_read:,}", flush=True)
+                    continue
                 obj_size = len(obj_content.encode("utf-8")) + (sep_len if current_md_blocks else 0)
+                obj_words = len(obj_content.split())
             else:
                 obj_json = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
                 obj_size = len(obj_json.encode("utf-8"))
@@ -265,9 +301,18 @@ def split_json(
             n_current = len(current_md_blocks) if output_format == "md" else len(current_objects)
             if max_objects_per_file and n_current >= max_objects_per_file:
                 write_part()
+            # Лимит по словам (для MD, под NotebookLM ~500k)
+            if (
+                output_format == "md"
+                and max_words_per_file
+                and current_md_blocks
+                and (current_words + obj_words > max_words_per_file)
+            ):
+                write_part()
 
             if output_format == "md":
                 current_md_blocks.append(obj_content)
+                current_words += obj_words
             else:
                 current_objects.append(obj)
             current_size += obj_size
@@ -285,12 +330,8 @@ def split_json(
         tmp_path = first_path + ".tmp"
         report_line = f"### Отчёт | Всего сообщений: {total_read:,}"
         with open(first_path, "r", encoding="utf-8") as fin, open(tmp_path, "w", encoding="utf-8") as fout:
-            fout.write(report_line + "\n---\n")
-            for line in fin:
-                # На всякий случай удаляем пустые строки.
-                if not line.strip():
-                    continue
-                fout.write(line.rstrip() + "\n")
+            fout.write(report_line + "\n\n")
+            fout.write(fin.read())
         os.replace(tmp_path, first_path)
 
     if progress_interval > 0:
@@ -320,6 +361,13 @@ def main() -> None:
             help="Максимальное количество объектов в одном файле",
         )
         parser_c.add_argument(
+            "--max-words",
+            type=int,
+            default=None,
+            metavar="N",
+            help="Макс. слов в одном .md файле (NotebookLM ~500k, по умолчанию 450k с запасом)",
+        )
+        parser_c.add_argument(
             "--array-path",
             type=str,
             default=None,
@@ -336,12 +384,47 @@ def main() -> None:
             help="Выходной формат: md или json",
         )
         parser_c.add_argument(
+            "--author-at-top",
+            action="store_true",
+            default=None,
+            dest="author_at_top",
+            help="В MD вынести автора один раз в начало (по умолчанию: True)",
+        )
+        parser_c.add_argument(
+            "--no-author-at-top",
+            action="store_false",
+            dest="author_at_top",
+            help="В MD не выносить автора в начало",
+        )
+        parser_c.add_argument(
+            "--skip-empty-messages",
+            action="store_true",
+            default=None,
+            dest="skip_empty_messages",
+            help="Не писать в MD блоки без текста (по умолчанию: True)",
+        )
+        parser_c.add_argument(
+            "--no-skip-empty-messages",
+            action="store_false",
+            dest="skip_empty_messages",
+            help="Писать в MD и пустые блоки",
+        )
+        parser_c.add_argument(
             "--show",
             action="store_true",
             help="Показать текущий конфиг и выйти",
         )
         args_c = parser_c.parse_args(sys.argv[2:])
-        if args_c.show and not any((args_c.max_size_mb is not None, args_c.max_objects is not None, args_c.array_path is not None, args_c.output_format is not None)):
+        has_any = (
+            args_c.max_size_mb is not None,
+            args_c.max_objects is not None,
+            args_c.max_words is not None,
+            args_c.array_path is not None,
+            args_c.output_format is not None,
+            args_c.author_at_top is not None,
+            args_c.skip_empty_messages is not None,
+        )
+        if args_c.show and not any(has_any):
             print("Текущий config.json:")
             for k, v in config.items():
                 print(f"  {k}: {v}")
@@ -350,10 +433,16 @@ def main() -> None:
             config["max_file_size_mb"] = args_c.max_size_mb
         if args_c.max_objects is not None:
             config["max_objects_per_file"] = args_c.max_objects
+        if args_c.max_words is not None:
+            config["max_words_per_file"] = args_c.max_words
         if args_c.array_path is not None:
             config["array_path"] = args_c.array_path
         if args_c.output_format is not None:
             config["output_format"] = args_c.output_format
+        if args_c.author_at_top is not None:
+            config["author_at_top"] = args_c.author_at_top
+        if args_c.skip_empty_messages is not None:
+            config["skip_empty_messages"] = args_c.skip_empty_messages
         save_config(config)
         print("config.json обновлён:")
         for k, v in config.items():
@@ -500,6 +589,13 @@ def main() -> None:
         help=f"Максимальное количество объектов в одном файле (конфиг: {config['max_objects_per_file']})",
     )
     parser.add_argument(
+        "--max-words",
+        type=int,
+        default=None,
+        metavar="N",
+        help=f"Макс. слов в одном .md (конфиг: {config.get('max_words_per_file', 450_000)})",
+    )
+    parser.add_argument(
         "--prefix",
         type=str,
         default=None,
@@ -527,6 +623,8 @@ def main() -> None:
         args.max_size_mb = config["max_file_size_mb"]
     if args.max_objects is None:
         args.max_objects = config["max_objects_per_file"]
+    if args.max_words is None and args.format == "md":
+        args.max_words = config.get("max_words_per_file")
     if args.array_path is None:
         args.array_path = config.get("array_path", "") or ""
     if args.format is None:
@@ -536,7 +634,10 @@ def main() -> None:
         args.output_dir = os.path.join(SCRIPT_DIR, "dist")
 
     # Показываем применяемые лимиты (из конфига или консоли)
-    print(f"Лимиты: max_size={args.max_size_mb} МБ, max_objects={args.max_objects}, array_path={repr(args.array_path) or '(корень)'}")
+    limits = f"max_size={args.max_size_mb} МБ, max_objects={args.max_objects}"
+    if args.format == "md" and args.max_words is not None:
+        limits += f", max_words={args.max_words:,}"
+    print(f"Лимиты: {limits}, array_path={repr(args.array_path) or '(корень)'}")
     sys.stdout.flush()
 
     # Список файлов для обработки (src — рядом со скриптом)
@@ -567,6 +668,9 @@ def main() -> None:
     if args.max_objects is not None and args.max_objects <= 0:
         print("Ошибка: --max-objects должно быть положительным", file=sys.stderr)
         sys.exit(1)
+    if args.max_words is not None and args.max_words <= 0:
+        print("Ошибка: --max-words должно быть положительным", file=sys.stderr)
+        sys.exit(1)
 
     all_created: list[str] = []
     for input_path in input_files:
@@ -579,8 +683,11 @@ def main() -> None:
                 output_prefix=prefix,
                 max_file_size_mb=args.max_size_mb,
                 max_objects_per_file=args.max_objects,
+                max_words_per_file=args.max_words,
                 array_path=args.array_path,
                 output_format=args.format,
+                author_at_top=config.get("author_at_top", True),
+                skip_empty_messages=config.get("skip_empty_messages", True),
             )
             ext = ".md" if args.format == "md" else ".json"
             print(f"{input_path} → {len(files)} файл(ов) {prefix}_*{ext}")
