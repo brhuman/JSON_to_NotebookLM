@@ -1,0 +1,6 @@
+{
+  "max_file_size_mb": 150,
+  "max_objects_per_file": 400000,
+  "array_path": "messages",
+  "output_format": "md"
+}
